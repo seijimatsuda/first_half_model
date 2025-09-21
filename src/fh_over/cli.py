@@ -26,6 +26,7 @@ from fh_over.vendors.flashscore import FlashScoreAdapter
 from fh_over.vendors.theoddsapi import TheOddsApiAdapter
 from fh_over.vendors.betfair import BetfairAdapter
 from fh_over.service.data_sync import DataSyncService, sync_all_data
+from fh_over.service.multi_league_sync import MultiLeagueSyncService, sync_all_leagues
 from fh_over.odds_integration import OddsIntegrationService
 
 app = typer.Typer(help="First-Half Over 0.5 Value Betting Scanner")
@@ -122,24 +123,42 @@ def scan(
     export_csv: Optional[str] = typer.Option(None, help="Export results to CSV file"),
     export_json: Optional[str] = typer.Option(None, help="Export results to JSON file"),
     export_summary: Optional[str] = typer.Option(None, help="Export summary to text file"),
-    show_all: bool = typer.Option(False, help="Show all fixtures, not just value signals")
+    show_all: bool = typer.Option(False, help="Show all fixtures, not just value signals"),
+    leagues: Optional[str] = typer.Option(None, help="Comma-separated list of league IDs to scan"),
+    all_leagues: bool = typer.Option(False, help="Scan all available leagues"),
+    exclude_leagues: Optional[str] = typer.Option(None, help="Comma-separated list of league IDs to exclude"),
+    league_types: Optional[str] = typer.Option(None, help="Filter by league types (League,Cup)"),
+    countries: Optional[str] = typer.Option(None, help="Comma-separated list of countries to include")
 ):
     """Scan fixtures for value bets."""
     
     async def _scan():
         scanner = ScannerService()
         
+        # Parse league filters
+        league_filters = {}
+        if leagues:
+            league_filters['include_leagues'] = [int(x.strip()) for x in leagues.split(',')]
+        if exclude_leagues:
+            league_filters['exclude_leagues'] = [int(x.strip()) for x in exclude_leagues.split(',')]
+        if league_types:
+            league_filters['league_types'] = [x.strip() for x in league_types.split(',')]
+        if countries:
+            league_filters['countries'] = [x.strip() for x in countries.split(',')]
+        if all_leagues:
+            league_filters['all_leagues'] = True
+        
         if scan_date:
             try:
                 scan_dt = datetime.strptime(scan_date, "%Y-%m-%d").date()
                 start_date = datetime.combine(scan_dt, datetime.min.time())
                 end_date = datetime.combine(scan_dt, datetime.max.time())
-                results = await scanner.scan_date_range(start_date, end_date)
+                results = await scanner.scan_date_range(start_date, end_date, league_filters=league_filters)
             except ValueError:
                 console.print("❌ Invalid date format. Use YYYY-MM-DD", style="red")
                 return
         else:
-            results = await scanner.scan_today()
+            results = await scanner.scan_today(league_filters=league_filters)
         
         if not results:
             console.print("No fixtures found to scan", style="yellow")
@@ -464,6 +483,105 @@ def sync_data(
     except Exception as e:
         console.print(f"❌ Error syncing data: {e}", style="red")
         raise typer.Exit(1)
+
+
+@app.command()
+def multi_scan(
+    days_ahead: int = typer.Option(7, help="Number of days ahead to scan"),
+    top_leagues_only: bool = typer.Option(False, help="Scan only top-tier leagues"),
+    export_csv: Optional[str] = typer.Option(None, help="Export results to CSV file"),
+    export_json: Optional[str] = typer.Option(None, help="Export results to JSON file"),
+    show_all: bool = typer.Option(False, help="Show all fixtures, not just value signals")
+):
+    """Scan multiple leagues for value bets."""
+    
+    async def _multi_scan():
+        console.print("🌍 Starting multi-league scan...", style="blue")
+        
+        # First sync data for all leagues
+        console.print("📊 Syncing league data...", style="blue")
+        sync_result = await sync_all_leagues(days_ahead, top_leagues_only)
+        
+        if not sync_result:
+            console.print("❌ Failed to sync league data", style="red")
+            return
+        
+        console.print(f"✅ Synced {sync_result['leagues_synced']} leagues with {sync_result['total_fixtures']} fixtures", style="green")
+        
+        # Now scan all fixtures
+        console.print("🔍 Scanning fixtures for value bets...", style="blue")
+        scanner = ScannerService()
+        
+        # Get date range
+        start_date = datetime.utcnow()
+        end_date = start_date + timedelta(days=days_ahead)
+        
+        # Scan all fixtures
+        results = await scanner.scan_date_range(start_date, end_date)
+        
+        if not results:
+            console.print("No fixtures found to scan", style="yellow")
+            return
+        
+        # Filter results if not showing all
+        if not show_all:
+            results = [r for r in results if r.signal]
+        
+        if not results:
+            console.print("No value signals found", style="yellow")
+            return
+        
+        # Group results by league
+        results_by_league = {}
+        for result in results:
+            league = result.league_name
+            if league not in results_by_league:
+                results_by_league[league] = []
+            results_by_league[league].append(result)
+        
+        # Display results
+        console.print(f"\n📈 Found {len(results)} value signals across {len(results_by_league)} leagues", style="green")
+        
+        for league_name, league_results in results_by_league.items():
+            console.print(f"\n🏆 {league_name} ({len(league_results)} signals)", style="bold")
+            
+            table = Table(show_header=True, header_style="bold magenta")
+            table.add_column("Fixture", style="cyan")
+            table.add_column("Date", style="green")
+            table.add_column("Lambda", style="blue")
+            table.add_column("P(Over 0.5)", style="blue")
+            table.add_column("Fair Odds", style="yellow")
+            table.add_column("Market Odds", style="yellow")
+            table.add_column("Edge %", style="red")
+            table.add_column("Stake", style="green")
+            
+            for result in league_results[:10]:  # Show top 10 per league
+                table.add_row(
+                    f"{result.home_team} vs {result.away_team}",
+                    result.match_date.strftime("%m-%d %H:%M"),
+                    f"{result.lambda_hat:.3f}",
+                    f"{result.p_hat:.3f}",
+                    f"{result.fair_odds:.2f}",
+                    f"{result.market_odds:.2f}" if result.market_odds else "N/A",
+                    f"{result.edge_pct:.2f}%" if result.edge_pct else "N/A",
+                    f"${result.stake_amount:.2f}"
+                )
+            
+            console.print(table)
+            
+            if len(league_results) > 10:
+                console.print(f"   ... and {len(league_results) - 10} more", style="dim")
+        
+        # Export results if requested
+        if export_csv:
+            export_to_csv(results, export_csv)
+            console.print(f"✅ Results exported to {export_csv}", style="green")
+        
+        if export_json:
+            export_to_json(results, export_json)
+            console.print(f"✅ Results exported to {export_json}", style="green")
+    
+    asyncio.run(_multi_scan())
 
 
 @app.command()

@@ -282,7 +282,7 @@ class ScannerService:
         # In a real implementation, this would query odds providers
         return 1.8, "mock_odds"  # Mock odds for testing
     
-    async def scan_today(self) -> List[ScanResult]:
+    async def scan_today(self, league_filters: Optional[Dict] = None) -> List[ScanResult]:
         """Scan all fixtures for today."""
         
         # Get fixtures for today
@@ -290,40 +290,32 @@ class ScannerService:
         start_date = datetime.combine(today, datetime.min.time())
         end_date = datetime.combine(today, datetime.max.time())
         
-        # Query database for fixtures
-        from sqlmodel import select
-        session = next(get_session())
-        try:
-            fixtures = session.exec(
-                select(Fixture).where(
-                    Fixture.match_date >= start_date,
-                    Fixture.match_date <= end_date
-                )
-            ).all()
-        finally:
-            session.close()
-        
-        results = []
-        for fixture in fixtures:
-            result = await self.scan_fixture(fixture)
-            if result:
-                results.append(result)
-        
-        return results
+        return await self.scan_date_range(start_date, end_date, league_filters)
     
-    async def scan_date_range(self, start_date: datetime, end_date: datetime) -> List[ScanResult]:
-        """Scan fixtures in a date range."""
+    async def scan_date_range(self, start_date: datetime, end_date: datetime, league_filters: Optional[Dict] = None) -> List[ScanResult]:
+        """Scan fixtures in a date range with optional league filtering."""
         
         # Query database for fixtures in date range
         from sqlmodel import select
         session = next(get_session())
         try:
-            fixtures = session.exec(
-                select(Fixture).where(
-                    Fixture.match_date >= start_date,
-                    Fixture.match_date <= end_date
-                )
-            ).all()
+            query = select(Fixture).where(
+                Fixture.match_date >= start_date,
+                Fixture.match_date <= end_date
+            )
+            
+            # Apply league filters if provided
+            if league_filters:
+                if 'include_leagues' in league_filters:
+                    query = query.where(Fixture.league_id.in_(league_filters['include_leagues']))
+                if 'exclude_leagues' in league_filters:
+                    query = query.where(~Fixture.league_id.in_(league_filters['exclude_leagues']))
+                if 'league_types' in league_filters:
+                    query = query.where(Fixture.league_type.in_(league_filters['league_types']))
+                if 'countries' in league_filters:
+                    query = query.where(Fixture.country.in_(league_filters['countries']))
+            
+            fixtures = session.exec(query).all()
         finally:
             session.close()
         
